@@ -15,8 +15,9 @@
 #include <xc.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
-// Configuration bits
+// Configuration bits for PIC18F458
 #pragma config OSC = HS         // High-speed oscillator
 #pragma config FCMEN = OFF      // Fail-Safe Clock Monitor disabled
 #pragma config IESO = OFF       // Internal/External Oscillator Switchover Mode disabled
@@ -76,17 +77,19 @@
 #define TRIS_LED_HIGH  TRISDbits.TRISD2
 
 // ============ Keypad Definitions ============
-// Rows: RB0-RB3
-// Columns: RB4-RB7
+// Rows: RB0-RB3 (outputs)
+// Columns: RB4-RB7 (inputs)
 #define ROW_PORT PORTB
 #define ROW_TRIS TRISB
 #define COL_PORT PORTB
 #define COL_TRIS TRISB
 
-#define SET_ROW_OUTPUT() { ROW_TRIS = 0x00; }
-#define SET_COL_INPUT()  { COL_TRIS = 0xF0; }
+#define SET_ROW_OUTPUT() { TRISBbits.TRISB0 = 0; TRISBbits.TRISB1 = 0; \
+                           TRISBbits.TRISB2 = 0; TRISBbits.TRISB3 = 0; }
+#define SET_COL_INPUT()  { TRISBbits.TRISB4 = 1; TRISBbits.TRISB5 = 1; \
+                           TRISBbits.TRISB6 = 1; TRISBbits.TRISB7 = 1; }
 
-// Keypad Matrix
+// Keypad Matrix Layout
 const char keypad[4][4] = {
     {'1', '2', '3', 'A'},
     {'4', '5', '6', 'B'},
@@ -112,27 +115,29 @@ void initADC(void);
 void initI2C(void);
 void initKeypad(void);
 void initLED(void);
-void initTimer(void);
 
 void I2C_Write(unsigned char data);
 void I2C_WriteAddr(unsigned char addr, unsigned char rw);
 void I2C_Start(void);
 void I2C_Stop(void);
 void I2C_Wait(void);
+void I2C_Ack(void);
 
 void LCD_Init(void);
 void LCD_SendCommand(unsigned char cmd);
 void LCD_SendData(unsigned char data);
 void LCD_SetCursor(unsigned char row, unsigned char col);
-void LCD_Print(char *str);
+void LCD_Print(const char *str);
 void LCD_Clear(void);
 void LCD_WriteCommand(unsigned char cmd);
+void LCD_WriteByte(unsigned char data, unsigned char rs);
 
 unsigned int ADC_Read(void);
 float ReadTemperature(void);
 void UpdateLED(float temp);
 char ScanKeypad(void);
 void ProcessKeypad(char key);
+void DisplayTemperature(void);
 
 void DelayMs(unsigned int ms);
 void DelayUs(unsigned int us);
@@ -153,20 +158,7 @@ void main(void) {
         temperature = ReadTemperature();
         UpdateLED(temperature);
         
-        LCD_Clear();
-        LCD_SetCursor(0, 0);
-        LCD_Print("Temp:");
-        
-        // Display temperature
-        sprintf(lcd_buffer, "%.1fC", temperature);
-        LCD_SetCursor(0, 6);
-        LCD_Print(lcd_buffer);
-        
-        LCD_SetCursor(1, 0);
-        LCD_Print("Set:");
-        sprintf(lcd_buffer, "%d", temp_setpoint);
-        LCD_SetCursor(1, 5);
-        LCD_Print(lcd_buffer);
+        DisplayTemperature();
         
         // Scan keypad
         char key = ScanKeypad();
@@ -174,72 +166,89 @@ void main(void) {
             ProcessKeypad(key);
         }
         
-        DelayMs(500);
+        DelayMs(300);
     }
 }
 
 // ============ System Initialization ============
 void initSystem(void) {
-    // Set all ports as outputs initially
-    TRISA = 0x01;  // RA0 = ADC input (Temperature sensor)
-    TRISB = 0xF0;  // RB0-RB3 = Keypad rows (output), RB4-RB7 = Columns (input)
-    TRISC = 0x18;  // RC3,RC4 = I2C (SDA, SCL)
-    TRISD = 0x00;  // RD0-RD2 = LED outputs
+    // Configure Port A: RA0 = ADC input
+    TRISA = 0xFF;    // All inputs
+    PORTA = 0x00;
+    
+    // Configure Port B: RB0-RB3 = Keypad rows (output), RB4-RB7 = Columns (input)
+    TRISB = 0xF0;    // RB0-RB3 output, RB4-RB7 input
+    PORTB = 0x00;
+    
+    // Configure Port C: RC3,RC4 = I2C (SDA, SCL)
+    TRISC = 0x18;    // RC3, RC4 as inputs (I2C)
+    PORTC = 0x00;
+    
+    // Configure Port D: RD0-RD2 = LED outputs
+    TRISD = 0x00;    // All outputs
+    PORTD = 0x00;
+    
+    // Configure Port E if needed
+    TRISE = 0x00;
+    PORTE = 0x00;
     
     initADC();
     initI2C();
     initLED();
     initKeypad();
-    initTimer();
 }
 
 // ============ ADC Initialization ============
 void initADC(void) {
+    // ADCON0: ADC Configuration Register 0
     ADCON0 = 0x00;  // ADC Off initially
-    ADCON1 = 0x0E;  // RA0 = Analog input, others digital
-    ADCON2 = 0xBD;  // Right justified, Fosc/64, 12 TAD
     
+    // ADCON1: ADC Configuration Register 1
+    ADCON1 = 0x0E;  // RA0 = Analog input (AN0), all others digital
+    
+    // ADCON2: ADC Configuration Register 2
+    ADCON2 = 0xBD;  // Right justified, Fosc/64, 12 TAD acquisition time
+    
+    // Select AN0 channel and enable ADC
     ADCON0bits.CHS = 0;      // Select AN0 channel
-    ADCON0bits.ADON = 1;     // Enable ADC
+    ADCON0bits.ADON = 1;     // Enable ADC module
 }
 
 // ============ I2C Initialization ============
 void initI2C(void) {
-    // I2C configuration
-    SSPADD = 99;    // Baud rate for 20MHz and 100kHz I2C
+    // I2C Configuration for Master Mode at 100kHz
+    // With 20MHz clock: SSPADD = (20MHz/(4*100kHz)) - 1 = 49
+    SSPADD = 49;    // Baud rate for 100kHz I2C
+    
     SSPCON1 = 0x28; // I2C Master mode
-    SSPCON2 = 0x00;
-    SSPSTAT = 0x00;
+    SSPCON2 = 0x00; // No repeated START or PEN
+    SSPSTAT = 0x00; // Disable slew rate control for master mode
+    
+    // Enable SSP interrupt if needed
+    PIE1bits.SSPIE = 0;  // Disable SSP interrupt for now
 }
 
 // ============ LED Initialization ============
 void initLED(void) {
-    TRIS_LED_LOW = 0;
-    TRIS_LED_MED = 0;
-    TRIS_LED_HIGH = 0;
+    TRIS_LED_LOW = 0;   // Output
+    TRIS_LED_MED = 0;   // Output
+    TRIS_LED_HIGH = 0;  // Output
     
-    LED_LOW = 0;
-    LED_MED = 0;
-    LED_HIGH = 0;
+    LED_LOW = 0;   // Turn off
+    LED_MED = 0;   // Turn off
+    LED_HIGH = 0;  // Turn off
 }
 
 // ============ Keypad Initialization ============
 void initKeypad(void) {
     SET_ROW_OUTPUT();
     SET_COL_INPUT();
-    ROW_PORT = 0x0F;  // Set all rows high
-}
-
-// ============ Timer Initialization ============
-void initTimer(void) {
-    T0CON = 0x87;   // Timer0, 8-bit, internal clock, 1:256 prescaler
-    TMR0IE = 1;     // Enable Timer0 interrupt
-    INTCON = 0xA0;  // Enable global and peripheral interrupts
+    PORTB = 0x0F;  // Set all rows high initially
 }
 
 // ============ I2C Functions ============
 void I2C_Wait(void) {
-    while((SSPCON2 & 0x1F) | (SSPSTATbits.RW));
+    while((SSPCON2 & 0x1F) || (SSPSTATbits.RW));
 }
 
 void I2C_Start(void) {
@@ -252,14 +261,31 @@ void I2C_Stop(void) {
     I2C_Wait();
 }
 
+void I2C_Ack(void) {
+    SSPCON2bits.ACKDT = 0;  // Acknowledge
+    SSPCON2bits.ACKEN = 1;
+    I2C_Wait();
+}
+
 void I2C_WriteAddr(unsigned char addr, unsigned char rw) {
     SSPBUF = (addr << 1) | rw;
     I2C_Wait();
+    
+    // Check for ACK from slave
+    if(SSPSTATbits.ACKSTAT) {
+        // No ACK received
+        I2C_Stop();
+    }
 }
 
 void I2C_Write(unsigned char data) {
     SSPBUF = data;
     I2C_Wait();
+    
+    if(SSPSTATbits.ACKSTAT) {
+        // No ACK from slave
+        I2C_Stop();
+    }
 }
 
 // ============ LCD Functions ============
@@ -273,28 +299,56 @@ void LCD_Init(void) {
     DelayMs(1);
     
     LCD_WriteCommand(0x28);  // 4-bit mode, 2 lines, 5x8 font
-    LCD_WriteCommand(0x0C);  // Display ON, Cursor OFF
+    DelayMs(1);
+    LCD_WriteCommand(0x0C);  // Display ON, Cursor OFF, Blink OFF
+    DelayMs(1);
     LCD_WriteCommand(0x01);  // Clear display
     DelayMs(2);
-    LCD_WriteCommand(0x06);  // Entry mode
+    LCD_WriteCommand(0x06);  // Entry mode: Increment, No shift
+    DelayMs(1);
 }
 
 void LCD_WriteCommand(unsigned char cmd) {
+    // RS = 0 (Command mode)
+    LCD_WriteByte(cmd, 0);
+}
+
+void LCD_WriteByte(unsigned char data, unsigned char rs) {
     I2C_Start();
-    I2C_WriteAddr(LCD_I2C_ADDR, 0);
+    I2C_WriteAddr(LCD_I2C_ADDR, 0);  // 0 = Write mode
+    
+    unsigned char control_byte;
+    unsigned char high_nibble = (data & 0xF0);
+    unsigned char low_nibble = ((data << 4) & 0xF0);
     
     // Send high nibble
-    I2C_Write((cmd & 0xF0) | LCD_BACKLIGHT);
-    I2C_Write((cmd & 0xF0) | 0x04 | LCD_BACKLIGHT);  // EN=1
-    DelayUs(1);
-    I2C_Write((cmd & 0xF0) | LCD_BACKLIGHT);        // EN=0
+    control_byte = high_nibble | LCD_BACKLIGHT | (rs ? 0x01 : 0x00);
+    I2C_Write(control_byte);
+    DelayUs(5);
+    
+    // Set Enable pin high
+    control_byte |= 0x04;  // EN = 1
+    I2C_Write(control_byte);
+    DelayUs(5);
+    
+    // Set Enable pin low
+    control_byte &= 0xFB;  // EN = 0
+    I2C_Write(control_byte);
     DelayUs(100);
     
     // Send low nibble
-    I2C_Write(((cmd << 4) & 0xF0) | LCD_BACKLIGHT);
-    I2C_Write(((cmd << 4) & 0xF0) | 0x04 | LCD_BACKLIGHT);  // EN=1
-    DelayUs(1);
-    I2C_Write(((cmd << 4) & 0xF0) | LCD_BACKLIGHT);        // EN=0
+    control_byte = low_nibble | LCD_BACKLIGHT | (rs ? 0x01 : 0x00);
+    I2C_Write(control_byte);
+    DelayUs(5);
+    
+    // Set Enable pin high
+    control_byte |= 0x04;  // EN = 1
+    I2C_Write(control_byte);
+    DelayUs(5);
+    
+    // Set Enable pin low
+    control_byte &= 0xFB;  // EN = 0
+    I2C_Write(control_byte);
     DelayUs(100);
     
     I2C_Stop();
@@ -302,39 +356,28 @@ void LCD_WriteCommand(unsigned char cmd) {
 
 void LCD_SendCommand(unsigned char cmd) {
     LCD_WriteCommand(cmd);
-}
-
-void LCD_SendData(unsigned char data) {
-    I2C_Start();
-    I2C_WriteAddr(LCD_I2C_ADDR, 0);
-    
-    // Send high nibble with RS=1 (data)
-    I2C_Write((data & 0xF0) | 0x01 | LCD_BACKLIGHT);
-    I2C_Write((data & 0xF0) | 0x05 | LCD_BACKLIGHT);  // EN=1, RS=1
-    DelayUs(1);
-    I2C_Write((data & 0xF0) | 0x01 | LCD_BACKLIGHT);  // EN=0
-    DelayUs(100);
-    
-    // Send low nibble with RS=1 (data)
-    I2C_Write(((data << 4) & 0xF0) | 0x01 | LCD_BACKLIGHT);
-    I2C_Write(((data << 4) & 0xF0) | 0x05 | LCD_BACKLIGHT);  // EN=1, RS=1
-    DelayUs(1);
-    I2C_Write(((data << 4) & 0xF0) | 0x01 | LCD_BACKLIGHT);  // EN=0
-    DelayUs(100);
-    
-    I2C_Stop();
-}
-
-void LCD_SetCursor(unsigned char row, unsigned char col) {
-    unsigned char address = (row == 0) ? col : (0x40 + col);
-    LCD_SendCommand(0x80 | address);
     DelayMs(1);
 }
 
-void LCD_Print(char *str) {
+void LCD_SendData(unsigned char data) {
+    // RS = 1 (Data mode)
+    LCD_WriteByte(data, 1);
+    DelayUs(100);
+}
+
+void LCD_SetCursor(unsigned char row, unsigned char col) {
+    unsigned char address;
+    if(row == 0) {
+        address = col;
+    } else {
+        address = 0x40 + col;
+    }
+    LCD_SendCommand(0x80 | address);
+}
+
+void LCD_Print(const char *str) {
     while(*str) {
         LCD_SendData(*str++);
-        DelayUs(100);
     }
 }
 
@@ -346,7 +389,9 @@ void LCD_Clear(void) {
 // ============ ADC and Temperature Functions ============
 unsigned int ADC_Read(void) {
     ADCON0bits.GO = 1;        // Start conversion
-    while(ADCON0bits.GO);      // Wait for conversion
+    while(ADCON0bits.GO);      // Wait for conversion to complete
+    
+    // Return 10-bit result
     return ((ADRESH << 8) | ADRESL);
 }
 
@@ -354,19 +399,23 @@ float ReadTemperature(void) {
     adc_value = ADC_Read();
     
     // LM35: Output = 10mV per °C
-    // At 5V reference: Temperature = (ADC_value * 5 / 1024) / 0.01
-    // Simplified: Temperature = ADC_value * 0.4883
-    temperature = adc_value * 0.4883;
+    // At 5V reference and 10-bit ADC:
+    // Temperature (°C) = (ADC_value * 5V / 1024) / 0.01V
+    // Temperature (°C) = ADC_value * 0.4883
+    
+    temperature = (float)adc_value * 0.4883;
     
     return temperature;
 }
 
 // ============ LED Control ============
 void UpdateLED(float temp) {
+    // Turn off all LEDs first
     LED_LOW = 0;
     LED_MED = 0;
     LED_HIGH = 0;
     
+    // Update LEDs based on temperature
     if(temp < TEMP_LOW_THRESHOLD) {
         LED_LOW = 1;   // Green LED - Low temperature
     }
@@ -378,41 +427,90 @@ void UpdateLED(float temp) {
     }
 }
 
+// ============ Display Temperature Function ============
+void DisplayTemperature(void) {
+    LCD_Clear();
+    
+    LCD_SetCursor(0, 0);
+    LCD_Print("Temp:");
+    
+    // Display current temperature
+    sprintf(lcd_buffer, "%.1f", temperature);
+    LCD_SetCursor(0, 6);
+    LCD_Print(lcd_buffer);
+    LCD_SendData(0xDF);  // Degree symbol
+    LCD_Print("C");
+    
+    LCD_SetCursor(1, 0);
+    LCD_Print("Set:");
+    
+    // Display setpoint
+    sprintf(lcd_buffer, "%d", temp_setpoint);
+    LCD_SetCursor(1, 5);
+    LCD_Print(lcd_buffer);
+    LCD_SendData(0xDF);  // Degree symbol
+    LCD_Print("C");
+}
+
 // ============ Keypad Functions ============
 char ScanKeypad(void) {
     unsigned char row, col;
     
     for(row = 0; row < 4; row++) {
         // Set current row to low, others high
-        ROW_PORT = ~(1 << row) & 0x0F;
-        DelayMs(5);
+        unsigned char row_pattern = 0x0F & ~(1 << row);  // Only current row is 0
+        PORTB = (PORTB & 0xF0) | row_pattern;
         
-        // Read columns
+        DelayMs(5);  // Debounce
+        
+        // Read column pins (RB4-RB7)
+        unsigned char col_port = PORTB >> 4;
+        
         for(col = 0; col < 4; col++) {
-            if(!(COL_PORT & (1 << (col + 4)))) {
+            if(!(col_port & (1 << col))) {  // Column is LOW
                 DelayMs(20);  // Debounce
-                if(!(COL_PORT & (1 << (col + 4)))) {
-                    // Wait for key release
-                    while(!(COL_PORT & (1 << (col + 4))));
-                    DelayMs(20);
+                
+                // Check again
+                col_port = PORTB >> 4;
+                if(!(col_port & (1 << col))) {
+                    // Valid key press - wait for release
+                    while(!(PORTB & (1 << (col + 4))));
+                    DelayMs(20);  // Debounce key release
+                    
+                    PORTB = (PORTB & 0xF0) | 0x0F;  // Set all rows high
                     return keypad[row][col];
                 }
             }
         }
     }
     
-    ROW_PORT = 0x0F;  // Set all rows high
-    return '\0';
+    PORTB = (PORTB & 0xF0) | 0x0F;  // Set all rows high
+    return '\0';  // No key pressed
 }
 
 void ProcessKeypad(char key) {
     if(key >= '0' && key <= '9') {
         // Number key pressed
         if(mode == 1) {  // In set mode
-            temp_setpoint = (temp_setpoint * 10) + (key - '0');
-            if(temp_setpoint > 99) {
-                temp_setpoint = key - '0';
+            if(temp_setpoint == 0) {
+                temp_setpoint = (key - '0');
+            } else {
+                temp_setpoint = (temp_setpoint * 10) + (key - '0');
             }
+            
+            // Limit to 99
+            if(temp_setpoint > 99) {
+                temp_setpoint = (key - '0');
+            }
+            
+            // Update display
+            LCD_Clear();
+            LCD_SetCursor(0, 0);
+            LCD_Print("Set Temp:");
+            LCD_SetCursor(1, 0);
+            sprintf(lcd_buffer, "%d", temp_setpoint);
+            LCD_Print(lcd_buffer);
+            DelayMs(500);
         }
     }
     else if(key == 'A') {
@@ -422,6 +520,9 @@ void ProcessKeypad(char key) {
         LCD_Clear();
         LCD_SetCursor(0, 0);
         LCD_Print("Set Temp:");
+        LCD_SetCursor(1, 0);
+        LCD_Print("(0-99)");
+        DelayMs(1000);
     }
     else if(key == 'B') {
         // Confirm and exit set mode
@@ -435,8 +536,9 @@ void ProcessKeypad(char key) {
         DelayMs(2000);
     }
     else if(key == 'C') {
-        // Clear
+        // Clear/Reset
         temp_setpoint = 0;
+        mode = 0;
         LCD_Clear();
         LCD_SetCursor(0, 0);
         LCD_Print("Cleared");
@@ -451,16 +553,26 @@ void ProcessKeypad(char key) {
         LCD_Print("Reset to 25");
         DelayMs(1500);
     }
+    else if(key == '*') {
+        // Escape/Exit set mode
+        mode = 0;
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_Print("Exited");
+        DelayMs(1000);
+    }
 }
 
 // ============ Delay Functions ============
 void DelayMs(unsigned int ms) {
-    for(unsigned int i = 0; i < ms; i++)
-        DelayUs(1000);
+    unsigned int i, j;
+    for(i = 0; i < ms; i++)
+        for(j = 0; j < 123; j++);  // Approximately 1ms at 20MHz
 }
 
 void DelayUs(unsigned int us) {
     while(us--) {
-        __delay_us(1);
+        asm("nop");
+        asm("nop");
     }
 }
